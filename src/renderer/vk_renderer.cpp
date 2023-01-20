@@ -5,6 +5,8 @@
 #endif
 #include <iostream>
 
+#include "vk_init.cpp"
+
 #define ArraySize(arr) sizeof((arr))/ sizeof((arr[0]))
 
 #define VK_CHECK(result)\
@@ -25,6 +27,8 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug_callback(
 }
 
 struct VkContext{
+    VkExtent2D screenSize;
+
     VkInstance instance;
     VkDebugUtilsMessengerEXT debugMessenger;
     VkSurfaceKHR surface;
@@ -33,7 +37,11 @@ struct VkContext{
     VkDevice device;
     VkQueue graphicsQueue;
     VkSwapchainKHR swapchain;
+    VkRenderPass renderPass;
     VkCommandPool commandPool;
+
+    VkPipelineLayout pipeLayout;
+    VkPipeline pipeline;
 
     VkSemaphore submitSemaphore;
     VkSemaphore aquireSemaphore;
@@ -41,12 +49,16 @@ struct VkContext{
     uint32_t scImgCount;
     //TODO: Suballocation from Main Memory
     VkImage scImages[5];
+    VkImageView scImageViews[5];
+    VkFramebuffer frameBuffers[5];
 
     int graphicsIdx;
 };
 
 bool vk_init(VkContext* vkcontext, void* window)
 {
+    platform_get_window_size(&vkcontext->screenSize.width, &vkcontext->screenSize.height);
+
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Game";
@@ -189,8 +201,8 @@ bool vk_init(VkContext* vkcontext, void* window)
 
         VkSwapchainCreateInfoKHR scInfo = {};
         scInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-        // scInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        scInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        scInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // scInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         // IGNORES ALPHA VALUES!!!
         scInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         scInfo.surface = vkcontext->surface;
@@ -204,6 +216,183 @@ bool vk_init(VkContext* vkcontext, void* window)
 
         VK_CHECK(vkGetSwapchainImagesKHR(vkcontext->device, vkcontext->swapchain, &vkcontext->scImgCount, 0));
         VK_CHECK(vkGetSwapchainImagesKHR(vkcontext->device, vkcontext->swapchain, &vkcontext->scImgCount, vkcontext->scImages));
+
+        // Create the image views
+        {
+            VkImageViewCreateInfo viewInfo = {};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.format = vkcontext->surfaceFormat.format;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.layerCount = 1;
+            viewInfo.subresourceRange.levelCount = 1;
+
+            for (uint32_t i = 0; i < vkcontext->scImgCount; i++) {
+                viewInfo.image = vkcontext->scImages[i];
+                VK_CHECK(vkCreateImageView(vkcontext->device, &viewInfo, 0, &vkcontext->scImageViews[i]));
+            }
+        }
+    }
+
+    // Renderpass
+    {
+        VkAttachmentDescription attachment = {};
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.format = vkcontext->surfaceFormat.format;
+
+        VkAttachmentReference colorAttachmentRef = {};
+        colorAttachmentRef.attachment = 0;
+        colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpassDesc = {};
+        subpassDesc.colorAttachmentCount = 1;
+        subpassDesc.pColorAttachments = &colorAttachmentRef;
+
+        VkAttachmentDescription attachments[] = {
+            attachment
+        };
+
+        VkRenderPassCreateInfo rpInfo = {};
+        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpInfo.pAttachments = attachments;
+        rpInfo.attachmentCount = ArraySize(attachments);
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpassDesc;
+
+        VK_CHECK(vkCreateRenderPass(vkcontext->device, &rpInfo, 0, &vkcontext->renderPass));
+    }
+
+    // Framebuffers
+    {
+        VkFramebufferCreateInfo fbInfo = {};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.width = vkcontext->screenSize.width;
+        fbInfo.height = vkcontext->screenSize.height;
+        fbInfo.renderPass = vkcontext->renderPass;
+        fbInfo.layers = 1;
+        fbInfo.attachmentCount = 1;
+
+        for (uint32_t i = 0; i < vkcontext->scImgCount; i++) {
+            fbInfo.pAttachments = &vkcontext->scImageViews[i];
+
+            VK_CHECK(vkCreateFramebuffer(vkcontext->device, &fbInfo, 0, &vkcontext->frameBuffers[i]));
+        }
+    }
+
+    // Pipeline Layout
+    {
+        VkPipelineLayoutCreateInfo layoutInfo = {};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        VK_CHECK(vkCreatePipelineLayout(vkcontext->device, &layoutInfo, 0, &vkcontext->pipeLayout));
+    }
+
+
+    // Pipeline
+    {
+        VkShaderModule vertexShader, fragmentShader;
+
+        uint32_t sizeInBytes;
+        char* code = platform_read_file("assets/shaders/shader.vert.spv", &sizeInBytes);
+
+        VkShaderModuleCreateInfo shaderInfo = {};
+        shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shaderInfo.pCode = (uint32_t*)code;
+        shaderInfo.codeSize = sizeInBytes;
+        VK_CHECK(vkCreateShaderModule(vkcontext->device, &shaderInfo, 0, &vertexShader));
+        //TODO: Suballocation from main allocation
+        delete code;
+
+        code = platform_read_file("assets/shaders/shader.frag.spv", &sizeInBytes);
+        shaderInfo.pCode = (uint32_t*)code;
+        shaderInfo.codeSize = sizeInBytes;
+        VK_CHECK(vkCreateShaderModule(vkcontext->device, &shaderInfo, 0, &fragmentShader));
+        //TODO: Suballocation from main allocation
+        delete code;
+
+        VkPipelineShaderStageCreateInfo vertexStage = {};
+        vertexStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        vertexStage.pName = "main";
+        vertexStage.module = vertexShader;
+
+        VkPipelineShaderStageCreateInfo fragStage = {};
+        fragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragStage.pName = "main";
+        fragStage.module = fragmentShader;
+
+
+        VkPipelineShaderStageCreateInfo shaderStages[] = {
+            vertexStage,
+            fragStage
+        };
+
+        VkPipelineVertexInputStateCreateInfo vertexInputState = {};
+        vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineColorBlendAttachmentState colorAttachment = {};
+        colorAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        colorAttachment.blendEnable = VK_FALSE;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendState = {};
+        colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendState.pAttachments = &colorAttachment;
+        colorBlendState.attachmentCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizationState = {};
+        rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizationState.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampleState = {};
+        multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkRect2D scissor = {};
+        VkViewport viewport = {};
+
+        VkPipelineViewportStateCreateInfo viewportState = {};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.scissorCount = 1;
+        viewportState.pScissors = &scissor;
+        viewportState.viewportCount = 1;
+        viewportState.pViewports = &viewport;
+
+        VkDynamicState dynamicStates[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR
+        };
+
+        VkPipelineDynamicStateCreateInfo dynamicState = {};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.pDynamicStates = dynamicStates;
+        dynamicState.dynamicStateCount = ArraySize(dynamicStates);
+
+        VkGraphicsPipelineCreateInfo pipeInfo = {};
+        pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeInfo.layout = vkcontext->pipeLayout;
+        pipeInfo.renderPass = vkcontext->renderPass;
+        pipeInfo.pVertexInputState = &vertexInputState;
+        pipeInfo.pColorBlendState = &colorBlendState;
+        pipeInfo.pStages = shaderStages;
+        pipeInfo.stageCount = ArraySize(shaderStages);
+        pipeInfo.pRasterizationState = &rasterizationState;
+        pipeInfo.pViewportState = &viewportState;
+        pipeInfo.pDynamicState = &dynamicState;
+        pipeInfo.pMultisampleState = &multisampleState;
+        pipeInfo.pInputAssemblyState = &inputAssembly;
+
+        VK_CHECK(vkCreateGraphicsPipelines(vkcontext->device, 0, 1, &pipeInfo, 0, &vkcontext->pipeline));
     }
 
     // Command Pool
@@ -236,21 +425,40 @@ bool vk_render(VkContext* vkcontext) {
     allocInfo.commandPool = vkcontext->commandPool; 
     VK_CHECK(vkAllocateCommandBuffers(vkcontext->device, &allocInfo, &cmd));
 
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkCommandBufferBeginInfo beginInfo = cmd_begin_info();
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+
+    VkClearValue clearValue = {};
+    clearValue.color = {1, 1, 0, 1};
+
+    VkRenderPassBeginInfo rpBeginInfo = {};
+    rpBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpBeginInfo.renderPass = vkcontext->renderPass;
+    rpBeginInfo.renderArea.extent = vkcontext->screenSize;
+    rpBeginInfo.framebuffer = vkcontext->frameBuffers[imgIdx];
+    rpBeginInfo.pClearValues = &clearValue;
+    rpBeginInfo.clearValueCount = 1;
+
+    vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
     // Rendering Commands
     {
-        VkClearColorValue color = {1, 1, 0, 1};
-        VkImageSubresourceRange range = {};
-        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        range.layerCount = 1;
-        range.levelCount = 1;
+        VkRect2D scissor = {};
+        scissor.extent = vkcontext->screenSize;
 
-        vkCmdClearColorImage(cmd, vkcontext->scImages[imgIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+        VkViewport viewport = {};
+        viewport.height = vkcontext->screenSize.height;
+        viewport.width = vkcontext->screenSize.width;
+        viewport.maxDepth = 1.0f;
+
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkcontext->pipeline);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
     }
+
+    vkCmdEndRenderPass(cmd);
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 
@@ -275,6 +483,8 @@ bool vk_render(VkContext* vkcontext) {
     presentInfo.pWaitSemaphores = &vkcontext->submitSemaphore;
     presentInfo.waitSemaphoreCount = 1;
     VK_CHECK(vkQueuePresentKHR(vkcontext->graphicsQueue, &presentInfo));
+
+    VK_CHECK(vkDeviceWaitIdle(vkcontext->device));
 
     vkFreeCommandBuffers(vkcontext->device, vkcontext->commandPool, 1, &cmd);
 

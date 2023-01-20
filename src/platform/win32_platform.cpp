@@ -1,7 +1,10 @@
 #include <windows.h>
+#include "defines.h"
+#include "platform.h"
 #include "renderer/vk_renderer.cpp"
 
-static bool running = true;
+global_variable bool running = true;
+global_variable HWND window = 0;
 
 LRESULT CALLBACK platform_window_callback(HWND window, UINT msg, WPARAM wParam, LPARAM lParam) {
 
@@ -14,11 +17,11 @@ LRESULT CALLBACK platform_window_callback(HWND window, UINT msg, WPARAM wParam, 
     return DefWindowProcA(window, msg, wParam, lParam);
 }
 
-bool platform_create_window(HWND window)
+bool platform_create_window()
 {
     HINSTANCE instance = GetModuleHandleA(0);
 
-    WNDCLASS wc = {};
+    WNDCLASSA wc = {};
     wc.lpfnWndProc = platform_window_callback;
     wc.hInstance = instance;
     wc.lpszClassName = "vulkan_engine_class";
@@ -26,11 +29,11 @@ bool platform_create_window(HWND window)
 
     if(!RegisterClassA(&wc))
     {
-        MessageBoxA(window, "Failed registering window class", "Error", MB_ICONEXCLAMATION | MB_OK);
+        MessageBoxA(0, "Failed registering window class", "Error", MB_ICONEXCLAMATION | MB_OK);
         return false;
     }
 
-    window = CreateWindowExA(
+   window = CreateWindowExA(
         WS_EX_APPWINDOW,
         "vulkan_engine_class",
         "Game",
@@ -39,7 +42,7 @@ bool platform_create_window(HWND window)
     );
 
     if (window == 0) {
-        MessageBoxA(window, "Failed creating window", "Error", MB_ICONEXCLAMATION | MB_OK);
+        MessageBoxA(0, "Failed creating window", "Error", MB_ICONEXCLAMATION | MB_OK);
         return false;
     }
 
@@ -59,18 +62,64 @@ void platform_update_window(HWND window) {
 
 int main() {
     VkContext vkcontext = {};
-    HWND window = 0;
-    if (!platform_create_window(window)) {
+
+    if (!platform_create_window()) {
         return -1;
     }
 
-    if (!vk_init(&vkcontext)) {
+    if (!vk_init(&vkcontext, window)) {
         return -1;
     }
 
     while (running) {
         platform_update_window(window);
+        if(!vk_render(&vkcontext)) {
+            return -1;
+        }
     }
 
     return 0;
+}
+
+void platform_get_window_size(uint32_t* width, uint32_t* height){
+    RECT rect;
+    GetClientRect(window, &rect);
+
+    *width = rect.right - rect.left;
+    *height = rect.bottom - rect.top;
+}
+
+char* platform_read_file(char* path, uint32_t* length) {
+    char*result = 0;
+
+    HANDLE file = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size;
+        if(GetFileSizeEx(file, &size)) {
+            *length = (uint32_t)size.QuadPart;
+            result = new char[*length];
+
+            // if file is bigger than 4 gb gg's
+            DWORD bytesRead;
+            if(ReadFile(file, result, *length, &bytesRead, 0)) {
+                // Success
+            }
+            else {
+                // TODO: assert and error checking
+                std::cout<<"failed reading file" << std::endl;
+            }
+        }
+        else {
+            // TODO: assert
+            std::cout<<"failed getting size of file" << std::endl;
+        }
+
+        CloseHandle(file);
+    }
+    else {
+        // TODO: Assert
+        std::cout<< "Failed opening file" << std::endl;
+    }
+
+    return result;
 }
